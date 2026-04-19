@@ -1,7 +1,7 @@
 # =============================================================================
 # AI 財務分析系統 - DCF估值教育系統
-# 程式名稱: 4-2_v3.py
-# 版本: v3.0.0
+# 程式名稱: app.py
+# 版本: v4.0.0
 # 更新日期: 2026-04-19
 #
 # 版本紀錄:
@@ -15,6 +15,17 @@
 #   - WACC / Beta / 股權成本等由財報推導
 #   - 新增台股股價查詢（TaiwanStockPrice）
 #   - 新增 FinMind Token 輸入欄位
+# v4.0.0 | 2026-04-19 | 規格說明書 v2 全面對齊修正
+#   - [A] 流通股數改由股本÷面額10元計算（修正帳面股東權益÷股價的錯誤邏輯）
+#   - [B] Beta 改由股票vs加權指數TAIEX近2年日報酬率迴歸計算，備援預設1.0
+#   - [C] 新增 DCF 合理價格區間驗證（NT$10~NT$10,000）
+#   - [D] 新增 WACC > 永續成長率防護檢查與明確警告
+#   - [E] 敏感性分析改為動態計算（非寫死數值）
+#   - [F] 情境分析改為調整永續成長率±1%、WACC±2%後重新計算
+#   - [G] 修正進階參數 expander 內 st.sidebar.slider → st.slider
+#   - [H] 新增預測年數滑桿（5~10年）並傳入 calculate_dcf
+#   - [I] 統一企業價值圖 Y 軸單位標示（新台幣千元）
+#   - [J] 新增 beta_calculated session_state 狀態管理
 # =============================================================================
 
 import streamlit as st
@@ -73,6 +84,69 @@ def validate_taiwan_stock_code(stock_code):
 # =============================================================================
 
 FINMIND_BASE_URL = "https://api.finmindtrade.com/api/v4/data"
+
+
+def calculate_beta(stock_id, token):
+    """
+    [修正B] 從 FinMind 取得股票與加權指數(TAIEX)近2年日報酬率，
+    以線性迴歸計算 Beta 係數。
+    若取得失敗（API錯誤、資料不足），備援回傳 (1.0, False)。
+    回傳：(beta值, 是否成功迴歸計算)
+    """
+    try:
+        start_date = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
+        end_date   = datetime.now().strftime("%Y-%m-%d")
+
+        # 取得個股日收盤價
+        stock_params = {
+            "dataset": "TaiwanStockDaily",
+            "data_id": stock_id,
+            "start_date": start_date,
+            "end_date": end_date,
+            "token": token
+        }
+        stock_resp = requests.get(FINMIND_BASE_URL, params=stock_params, timeout=15)
+        stock_data = stock_resp.json().get("data", [])
+
+        # 取得加權指數 TAIEX 日收盤價
+        taiex_params = {
+            "dataset": "TaiwanStockDaily",
+            "data_id": "TAIEX",
+            "start_date": start_date,
+            "end_date": end_date,
+            "token": token
+        }
+        taiex_resp = requests.get(FINMIND_BASE_URL, params=taiex_params, timeout=15)
+        taiex_data = taiex_resp.json().get("data", [])
+
+        if not stock_data or not taiex_data:
+            return 1.0, False
+
+        df_stock = pd.DataFrame(stock_data)[["date", "close"]].rename(columns={"close": "stock"})
+        df_taiex = pd.DataFrame(taiex_data)[["date", "close"]].rename(columns={"close": "taiex"})
+
+        df = pd.merge(df_stock, df_taiex, on="date").sort_values("date")
+        df["stock"] = pd.to_numeric(df["stock"], errors="coerce")
+        df["taiex"] = pd.to_numeric(df["taiex"], errors="coerce")
+        df = df.dropna()
+
+        if len(df) < 60:  # 至少需要60個交易日
+            return 1.0, False
+
+        # 計算日報酬率
+        df["stock_ret"] = df["stock"].pct_change()
+        df["taiex_ret"] = df["taiex"].pct_change()
+        df = df.dropna()
+
+        # 線性迴歸：stock_ret = alpha + beta * taiex_ret
+        cov_matrix = np.cov(df["stock_ret"], df["taiex_ret"])
+        beta = cov_matrix[0, 1] / cov_matrix[1, 1]
+        beta = float(np.clip(beta, 0.3, 3.0))  # 限制在合理範圍
+        return beta, True
+
+    except Exception:
+        return 1.0, False
+
 
 def finmind_get(dataset, stock_id, token, start_date="2019-01-01", end_date=None):
     """通用 FinMind API 請求函式"""
@@ -201,14 +275,14 @@ def extract_income_value(income_records, key, default=0):
     return float(val) if val is not None else default
 
 
-def calculate_dcf_params_from_finmind(financial_data, current_price, stock_id):
+def calculate_dcf_params_from_finmind(financial_data, current_price, stock_id, token):
     """
     從 FinMind 財報資料計算 DCF 所需參數
-    回傳 default_params（供側邊欄滑桿預設值使用）
+    回傳 (default_params, beta_calculated)
     """
-    income = financial_data.get("income_statement", [])
+    income  = financial_data.get("income_statement", [])
     balance = financial_data.get("balance_sheet", [])
-    cash = financial_data.get("cash_flow", [])
+    cash    = financial_data.get("cash_flow", [])
 
     # ── 損益表數據 ──
     revenue      = extract_income_value(income, "Revenue", 1)
@@ -232,11 +306,22 @@ def calculate_dcf_params_from_finmind(financial_data, current_price, stock_id):
     inventories    = extract_income_value(balance, "Inventories", 0)
     payables       = extract_income_value(balance, "AccountsPayable", 0)
 
+    # [修正A] 流通股數：優先從股本÷面額10元計算（台股面額統一10元）
+    paid_in_capital = extract_income_value(balance, "PaidInCapital", 0)
+    if paid_in_capital > 0:
+        # FinMind 財報單位為千元，股本單位亦為千元，÷10(元) = 千股，需再×1000=股
+        shares_outstanding = (paid_in_capital * 1000) / 10
+    elif current_price > 0 and total_equity > 0:
+        # 備援：用市值估算（財報股東權益帳面值估計，僅供備援）
+        shares_outstanding = (total_equity * 1000) / current_price
+    else:
+        shares_outstanding = 1
+
     # ── 現金流量表數據 ──
-    op_cf    = extract_income_value(cash, "CashFlowsFromOperatingActivities", 0)
-    capex    = abs(extract_income_value(cash, "PropertyAndPlantAndEquipment", 0))
-    inv_cf   = extract_income_value(cash, "CashFlowsFromInvestingActivities", 0)
-    fin_cf   = extract_income_value(cash, "CashFlowsFromFinancingActivities", 0)
+    op_cf  = extract_income_value(cash, "CashFlowsFromOperatingActivities", 0)
+    capex  = abs(extract_income_value(cash, "PropertyAndPlantAndEquipment", 0))
+    inv_cf = extract_income_value(cash, "CashFlowsFromInvestingActivities", 0)
+    fin_cf = extract_income_value(cash, "CashFlowsFromFinancingActivities", 0)
 
     # ── 計算各項比率 ──
     revenue_growth = (revenue - revenue_prev) / abs(revenue_prev) if revenue_prev != 0 else 0.10
@@ -245,68 +330,62 @@ def calculate_dcf_params_from_finmind(financial_data, current_price, stock_id):
     capex_pct      = capex / revenue if revenue != 0 else 0.05
     op_cf_pct      = op_cf / revenue if revenue != 0 else 0.15
     tax_rate       = 1 - (net_income / pretax) if pretax != 0 else 0.20
-    tax_rate       = max(0.05, min(0.40, tax_rate))  # 限制在合理範圍
+    tax_rate       = max(0.05, min(0.40, tax_rate))
 
     # ── WACC 推導 ──
-    # 無風險利率：使用台灣10年期公債近似值
-    risk_free_rate = 0.015  # 台灣約1.5%（可調整）
-    # 市場風險溢價：台股歷史平均約6%
-    market_risk_premium = 0.06
-    # Beta：以資產負債比推估，無法直接取得時設1.0
-    equity_ratio = total_equity / total_assets if total_assets != 0 else 0.5
-    beta = max(0.6, min(2.0, 1.0 + (1 - equity_ratio) * 0.5))
-    # 股權成本（CAPM）
-    cost_of_equity = risk_free_rate + beta * market_risk_premium
-    # 稅後債務成本：假設借款利率約3%（台灣企業平均）
-    cost_of_debt_pretax = 0.03
-    cost_of_debt = cost_of_debt_pretax * (1 - tax_rate)
-    # 資本結構
-    total_capital = total_equity + total_debt if (total_equity + total_debt) > 0 else 1
-    equity_weight = total_equity / total_capital
-    debt_weight   = total_debt / total_capital
-    # WACC
-    wacc = equity_weight * cost_of_equity + debt_weight * cost_of_debt
+    risk_free_rate      = 0.015   # 台灣10年期公債約1.5%
+    market_risk_premium = 0.06    # 台股市場風險溢價約6%
 
-    # 長期成長率：台股保守設2%
-    long_term_growth = 0.02
+    # [修正B] Beta：優先從股票vs TAIEX 近2年日報酬率迴歸計算
+    beta, beta_calculated = calculate_beta(stock_id, token)
+
+    cost_of_equity      = risk_free_rate + beta * market_risk_premium
+    cost_of_debt_pretax = 0.03
+    cost_of_debt        = cost_of_debt_pretax * (1 - tax_rate)
+    total_capital       = total_equity + total_debt if (total_equity + total_debt) > 0 else 1
+    equity_weight       = total_equity / total_capital
+    debt_weight         = total_debt / total_capital
+    wacc                = equity_weight * cost_of_equity + debt_weight * cost_of_debt
+    long_term_growth    = 0.02
 
     default_params = {
         # 成長與獲利
-        "revenueGrowthPct":            max(-0.2, min(2.0, revenue_growth)),
-        "ebitdaPct":                   max(0.01, min(0.80, ebitda_pct)),
-        "capitalExpenditurePct":       max(0.001, min(0.30, capex_pct)),
-        "operatingCashFlowPct":        max(0.001, min(0.60, op_cf_pct)),
+        "revenueGrowthPct":               max(-0.2, min(2.0, revenue_growth)),
+        "ebitdaPct":                       max(0.01, min(0.80, ebitda_pct)),
+        "capitalExpenditurePct":          max(0.001, min(0.30, capex_pct)),
+        "operatingCashFlowPct":           max(0.001, min(0.60, op_cf_pct)),
         "depreciationAndAmortizationPct": depreciation / revenue if revenue != 0 else 0.03,
         # 資本成本
-        "riskFreeRate":                risk_free_rate,
-        "marketRiskPremium":           market_risk_premium,
-        "beta":                        beta,
-        "costOfEquity":                cost_of_equity,
-        "costOfDebt":                  cost_of_debt,
-        "wacc":                        max(0.03, min(0.20, wacc)),
+        "riskFreeRate":                   risk_free_rate,
+        "marketRiskPremium":              market_risk_premium,
+        "beta":                           beta,
+        "costOfEquity":                   cost_of_equity,
+        "costOfDebt":                     cost_of_debt,
+        "wacc":                           max(0.03, min(0.20, wacc)),
         # 其他
-        "taxRate":                     tax_rate,
-        "longTermGrowthRate":          long_term_growth,
+        "taxRate":                        tax_rate,
+        "longTermGrowthRate":             long_term_growth,
         # 資產負債比率
-        "cashPct":                     cash_equiv / revenue if revenue != 0 else 0.10,
-        "receivablesPct":              receivables / revenue if revenue != 0 else 0.10,
-        "inventoriesPct":              inventories / revenue if revenue != 0 else 0.05,
-        "payablePct":                  payables / revenue if revenue != 0 else 0.08,
+        "cashPct":                        cash_equiv / revenue if revenue != 0 else 0.10,
+        "receivablesPct":                 receivables / revenue if revenue != 0 else 0.10,
+        "inventoriesPct":                 inventories / revenue if revenue != 0 else 0.05,
+        "payablePct":                     payables / revenue if revenue != 0 else 0.08,
         # 公司資訊
-        "currentPrice":                current_price,
-        "revenue":                     revenue,
-        "totalEquity":                 total_equity,
-        "totalDebt":                   total_debt,
-        "cashAndEquiv":                cash_equiv,
-        "sharesOutstanding":           total_equity / current_price if current_price > 0 else 1,
+        "currentPrice":                   current_price,
+        "revenue":                        revenue,
+        "totalEquity":                    total_equity,
+        "totalDebt":                      total_debt,
+        "cashAndEquiv":                   cash_equiv,
+        "sharesOutstanding":              max(1, shares_outstanding),  # [修正A]
+        "paidInCapital":                  paid_in_capital,
     }
-    return default_params
+    return default_params, beta_calculated
 
 
 def calculate_dcf(params, n_years=5):
     """
-    自行計算 DCF 估值
-    回傳完整計算結果 dict（對應原 FMP API 格式鍵名，方便後續顯示相容）
+    自行計算 DCF 估值（[修正H] n_years 由外部傳入，預設5年）
+    回傳完整計算結果 dict
     """
     revenue          = params.get("revenue", 1)
     rev_growth       = params.get("revenueGrowthPct", 0.10)
@@ -406,36 +485,66 @@ def calculate_dcf(params, n_years=5):
 # 驗證與圖表函式
 # =============================================================================
 
-def validate_dcf_result(dcf_data, ticker):
-    """驗證DCF計算結果的合理性"""
+def validate_dcf_result(dcf_data, ticker, long_term_growth_rate=0.02):
+    """
+    驗證DCF計算結果的合理性（4項檢查）
+    [修正C] 新增合理價格區間檢查（NT$10~NT$10,000）
+    [修正D] 新增 WACC > 永續成長率檢查
+    """
     try:
-        dcf_price    = dcf_data.get("equityValuePerShare", 0)
+        dcf_price     = dcf_data.get("equityValuePerShare", 0)
         current_price = dcf_data.get("price", 0)
+        wacc_val      = dcf_data.get("wacc", 0)   # 已為百分比格式
         validation_results = []
 
+        # 檢查1：DCF估值正負
         if dcf_price > 0:
             validation_results.append("✅ DCF估值計算成功")
         else:
             validation_results.append("⚠️ DCF估值為零或負值，請檢查財報數據")
 
+        # 檢查2：[修正C] 合理台股價格區間 NT$10~NT$10,000
+        if 10 <= dcf_price <= 10000:
+            validation_results.append(f"✅ DCF估值在合理台股價格區間（NT${dcf_price:.2f}，區間：NT$10~NT$10,000）")
+        elif dcf_price > 0:
+            validation_results.append(
+                f"⚠️ DCF估值 NT${dcf_price:.2f} 超出合理台股價格區間（NT$10~NT$10,000），"
+                "請確認財報數據與假設是否正確"
+            )
+
+        # 檢查3：與市價偏離度
         if current_price > 0:
             deviation = abs((dcf_price - current_price) / current_price * 100)
             if deviation <= 50:
-                validation_results.append("✅ 與市價偏離在合理範圍內")
+                validation_results.append(f"✅ 與市價偏離在合理範圍內（{deviation:.1f}%）")
             elif deviation <= 100:
                 validation_results.append(f"⚠️ 與市價偏離較大：{deviation:.1f}%")
             else:
                 validation_results.append(f"❌ 與市價偏離過大：{deviation:.1f}%，請確認假設合理性")
 
+        # 檢查4：[修正D] WACC > 永續成長率（終值計算有效性）
+        wacc_decimal = wacc_val / 100 if wacc_val > 1 else wacc_val
+        if wacc_decimal > long_term_growth_rate:
+            validation_results.append(
+                f"✅ WACC（{wacc_val:.2f}%）> 永續成長率（{long_term_growth_rate*100:.1f}%），終值計算有效"
+            )
+        else:
+            validation_results.append(
+                f"❌ WACC（{wacc_val:.2f}%）≤ 永續成長率（{long_term_growth_rate*100:.1f}%），"
+                "終值計算無效！請提高 WACC 或降低永續成長率"
+            )
+
+        # 檢查5：終值佔比
         enterprise_value = dcf_data.get("enterpriseValue", 0)
-        pv_cash_flows    = dcf_data.get("sumPvUfcf", 0)
         terminal_value   = dcf_data.get("presentTerminalValue", 0)
         if enterprise_value > 0:
             terminal_ratio = terminal_value / enterprise_value * 100
             if 40 <= terminal_ratio <= 95:
                 validation_results.append(f"✅ 終值占比合理：{terminal_ratio:.1f}%")
             else:
-                validation_results.append(f"⚠️ 終值占比異常：{terminal_ratio:.1f}%，建議調整 WACC 或長期成長率")
+                validation_results.append(
+                    f"⚠️ 終值占比異常：{terminal_ratio:.1f}%，建議調整 WACC 或長期成長率"
+                )
 
         return validation_results
     except Exception as e:
@@ -507,7 +616,7 @@ def create_wacc_breakdown_chart(dcf_data):
 
 
 def create_dcf_components_breakdown(dcf_data):
-    """DCF企業價值構成分解圖"""
+    """DCF企業價值構成分解圖 [修正I] 統一 Y 軸單位標示為新台幣千元"""
     try:
         fig = go.Figure()
         fig.add_trace(go.Bar(
@@ -524,7 +633,7 @@ def create_dcf_components_breakdown(dcf_data):
         ))
         fig.update_layout(
             title="DCF企業價值構成分析",
-            yaxis_title="價值（新台幣千元）",
+            yaxis_title="價值（新台幣 千元）",
             barmode="stack",
             height=400,
             template="plotly_dark",
@@ -538,33 +647,88 @@ def create_dcf_components_breakdown(dcf_data):
 
 
 def create_sensitivity_analysis(dcf_data, base_params):
-    """敏感性分析表"""
+    """
+    [修正E] 敏感性分析表：對各參數分別調整±10%後重新計算DCF，
+    動態產生影響幅度，不使用寫死數值。
+    """
     try:
-        sensitivity_data = {
-            "參數": ["營收成長率", "EBITDA率", "長期成長率", "WACC", "稅率"],
-            "基準值": [
-                f"{base_params.get('revenueGrowthPct', 0)*100:.1f}%",
-                f"{base_params.get('ebitdaPct', 0)*100:.1f}%",
-                f"{base_params.get('longTermGrowthRate', 0)*100:.1f}%",
-                f"{dcf_data.get('wacc', 0):.2f}%",
-                f"{base_params.get('taxRate', 0)*100:.1f}%"
-            ],
-            "向上10%影響": ["+18%", "+15%", "+35%", "-25%", "-8%"],
-            "向下10%影響": ["-18%", "-15%", "-35%", "+25%", "+8%"]
-        }
-        return pd.DataFrame(sensitivity_data)
+        base_price = dcf_data.get("equityValuePerShare", 0)
+        if base_price <= 0:
+            return None
+
+        param_configs = [
+            ("營收成長率",  "revenueGrowthPct",    base_params.get("revenueGrowthPct", 0.10),   True),
+            ("EBITDA率",   "ebitdaPct",            base_params.get("ebitdaPct", 0.25),           True),
+            ("長期成長率",  "longTermGrowthRate",   base_params.get("longTermGrowthRate", 0.02),  True),
+            ("WACC",       "wacc",                 base_params.get("wacc", 0.09),                False),
+            ("稅率",       "taxRate",              base_params.get("taxRate", 0.20),             True),
+        ]
+
+        rows = []
+        n_years = base_params.get("n_years", 5)
+        for label, key, base_val, positive_good in param_configs:
+            # 向上 +10%
+            params_up = dict(base_params)
+            params_up[key] = base_val * 1.10
+            result_up = calculate_dcf(params_up, n_years=n_years)
+            price_up  = result_up.get("equityValuePerShare", base_price)
+            chg_up    = (price_up - base_price) / base_price * 100 if base_price != 0 else 0
+
+            # 向下 -10%
+            params_dn = dict(base_params)
+            params_dn[key] = base_val * 0.90
+            result_dn = calculate_dcf(params_dn, n_years=n_years)
+            price_dn  = result_dn.get("equityValuePerShare", base_price)
+            chg_dn    = (price_dn - base_price) / base_price * 100 if base_price != 0 else 0
+
+            fmt_base = f"{base_val*100:.1f}%" if key != "wacc" else f"{base_val*100:.2f}%"
+            rows.append({
+                "參數":       label,
+                "基準值":     fmt_base,
+                "向上10%影響": f"{chg_up:+.1f}%",
+                "向下10%影響": f"{chg_dn:+.1f}%",
+            })
+
+        return pd.DataFrame(rows)
     except Exception as e:
         st.error(f"敏感性分析錯誤：{str(e)}")
         return None
 
 
 def create_scenario_analysis_chart(dcf_result, base_params):
-    """三情境 DCF 估值圖（悲觀 / 基準 / 樂觀）"""
+    """
+    [修正F] 三情境 DCF 估值圖：依規格調整參數後重新計算，非直接縮放結果。
+    - 悲觀：永續成長率 -1%、WACC +2%
+    - 基準：當前設定
+    - 樂觀：永續成長率 +1%、WACC -1%
+    """
     try:
-        base_val = dcf_result.get("equityValuePerShare", 0)
-        scenarios = ["悲觀情境\n（成長率-30%）", "基準情境", "樂觀情境\n（成長率+30%）"]
-        values    = [base_val * 0.65, base_val, base_val * 1.35]
-        colors    = ["#E74C3C", "#F39C12", "#28B463"]
+        base_val     = dcf_result.get("equityValuePerShare", 0)
+        n_years      = base_params.get("n_years", 5)
+        base_ltg     = base_params.get("longTermGrowthRate", 0.02)
+        base_wacc    = base_params.get("wacc", 0.09)
+
+        # 悲觀情境
+        params_bear = dict(base_params)
+        params_bear["longTermGrowthRate"] = max(0.001, base_ltg - 0.01)
+        params_bear["wacc"]               = min(0.30,  base_wacc + 0.02)
+        result_bear = calculate_dcf(params_bear, n_years=n_years)
+        val_bear    = result_bear.get("equityValuePerShare", base_val * 0.65)
+
+        # 樂觀情境
+        params_bull = dict(base_params)
+        params_bull["longTermGrowthRate"] = base_ltg + 0.01
+        params_bull["wacc"]               = max(0.01, base_wacc - 0.01)
+        result_bull = calculate_dcf(params_bull, n_years=n_years)
+        val_bull    = result_bull.get("equityValuePerShare", base_val * 1.35)
+
+        scenarios = [
+            f"悲觀情境\n（永續成長率{(base_ltg-0.01)*100:.1f}%、WACC+2%）",
+            "基準情境",
+            f"樂觀情境\n（永續成長率{(base_ltg+0.01)*100:.1f}%、WACC-1%）",
+        ]
+        values = [val_bear, base_val, val_bull]
+        colors = ["#E74C3C", "#F39C12", "#28B463"]
 
         fig = go.Figure()
         fig.add_trace(go.Bar(
@@ -689,6 +853,8 @@ if "financial_data" not in st.session_state:
     st.session_state.financial_data = {}
 if "stock_info" not in st.session_state:
     st.session_state.stock_info = {}
+if "beta_calculated" not in st.session_state:  # [修正J]
+    st.session_state.beta_calculated = False
 
 # =============================================================================
 # 側邊欄控制
@@ -726,17 +892,22 @@ if load_company_button:
                 current_price = get_finmind_stock_price(ticker, finmind_token)
                 # 取得公司基本資訊
                 stock_info = get_finmind_stock_info(ticker, finmind_token)
-                # 計算 DCF 預設參數
-                default_params = calculate_dcf_params_from_finmind(financial_data, current_price, ticker)
+                # [修正B+A] 計算 DCF 預設參數（含 Beta 迴歸計算與正確股數）
+                default_params, beta_calc = calculate_dcf_params_from_finmind(
+                    financial_data, current_price, ticker, finmind_token
+                )
 
-                st.session_state.financial_data  = financial_data
-                st.session_state.default_params  = default_params
-                st.session_state.stock_info      = stock_info
-                st.session_state.company_data    = {"currentPrice": current_price}
-                st.session_state.company_loaded  = True
+                st.session_state.financial_data   = financial_data
+                st.session_state.default_params   = default_params
+                st.session_state.stock_info       = stock_info
+                st.session_state.company_data     = {"currentPrice": current_price}
+                st.session_state.company_loaded   = True
+                st.session_state.beta_calculated  = beta_calc  # [修正J]
 
                 company_name = stock_info.get("stock_name", ticker)
+                beta_msg = "（迴歸計算）" if beta_calc else "（備援預設值1.0）"
                 st.sidebar.success(f"✅ 已載入 {company_name}（{ticker}）數據")
+                st.sidebar.caption(f"Beta係數{beta_msg}")
 
             except Exception as e:
                 st.sidebar.error(f"❌ 載入失敗：{str(e)}")
@@ -745,12 +916,14 @@ if load_company_button:
 # 公司基本資訊顯示
 if st.session_state.company_loaded:
     info = st.session_state.stock_info
+    beta_status = "✅ 迴歸計算" if st.session_state.beta_calculated else "⚠️ 備援預設值1.0"
     st.sidebar.markdown("#### 📋 公司基本資訊")
     st.sidebar.info(f"""
 **公司**：{info.get('stock_name', ticker)}（{ticker}）
 **產業**：{info.get('industry_category', 'N/A')}
 **類型**：{info.get('type', 'N/A')}
 **當前股價**：NT${st.session_state.default_params.get('currentPrice', 0):.2f}
+**Beta計算**：{beta_status}
 **載入時間**：{datetime.now().strftime('%H:%M:%S')}
     """)
 
@@ -814,35 +987,49 @@ if st.session_state.company_loaded:
         step=0.1,
         help="台股歷史市場風險溢價"
     )
+    beta_help = (
+        f"系統風險係數（迴歸計算：{defaults.get('beta', 1.0):.2f}）"
+        if st.session_state.beta_calculated
+        else f"系統風險係數（備援預設值1.0，因資料不足無法迴歸計算）"
+    )
     beta = st.sidebar.slider(
         "Beta係數",
         min_value=0.3, max_value=2.5,
         value=float(round(defaults.get("beta", 1.0), 2)),
         step=0.05,
-        help=f"系統風險係數（財報推導：{defaults.get('beta', 1.0):.2f}）"
+        help=beta_help
     )
 
     with st.sidebar.expander("📽 進階參數"):
-        terminal_growth = st.sidebar.slider(
+        # [修正G] expander 內使用 st.slider（非 st.sidebar.slider）
+        terminal_growth = st.slider(
             "永續成長率（%）",
             min_value=0.5, max_value=4.0,
             value=float(round(defaults.get("longTermGrowthRate", 0.02) * 100, 1)),
             step=0.1,
             help="長期永續成長率，台灣企業建議2%以下"
         )
-        tax_rate = st.sidebar.slider(
+        tax_rate = st.slider(
             "有效稅率（%）",
             min_value=10.0, max_value=35.0,
             value=float(round(defaults.get("taxRate", 0.20) * 100, 1)),
             step=1.0,
             help=f"公司實際稅率（財報推導：{defaults.get('taxRate', 0)*100:.1f}%）"
         )
-        operating_cf_pct = st.sidebar.slider(
+        operating_cf_pct = st.slider(
             "營運現金流比例（%）",
             min_value=1.0, max_value=60.0,
             value=float(round(defaults.get("operatingCashFlowPct", 0.15) * 100, 1)),
             step=1.0,
             help=f"營運現金流佔營收比例（財報推導：{defaults.get('operatingCashFlowPct', 0)*100:.1f}%）"
+        )
+        # [修正H] 新增預測年數滑桿
+        n_years = st.slider(
+            "DCF預測年數（年）",
+            min_value=5, max_value=10,
+            value=5,
+            step=1,
+            help="DCF預測期間，通常設定5~10年；預測期越長，終值佔比越低"
         )
 
     # Anthropic Claude API Key
@@ -888,6 +1075,7 @@ if st.session_state.company_loaded and calculate_button:
             "taxRate":                     tax_rate / 100,
             "operatingCashFlowPct":        operating_cf_pct / 100,
             "depreciationAndAmortizationPct": defaults.get("depreciationAndAmortizationPct", 0.03),
+            "n_years":                     n_years,  # [修正H]
             # 財報基礎數字
             "revenue":                     defaults.get("revenue", 1),
             "totalEquity":                 defaults.get("totalEquity", 1),
@@ -902,12 +1090,22 @@ if st.session_state.company_loaded and calculate_button:
             )
         }
 
+        # [修正D] 計算前先檢查 WACC > 永續成長率
+        wacc_val = dcf_parameters["wacc"]
+        ltg_val  = dcf_parameters["longTermGrowthRate"]
+        if wacc_val <= ltg_val:
+            st.error(
+                f"❌ WACC（{wacc_val*100:.2f}%）≤ 永續成長率（{ltg_val*100:.1f}%），"
+                "終值計算將無效！請提高 WACC 或降低永續成長率後再計算。"
+            )
+            st.stop()
+
         # 執行 DCF 計算
         with st.spinner("正在計算 DCF 估值..."):
-            dcf_result = calculate_dcf(dcf_parameters)
+            dcf_result = calculate_dcf(dcf_parameters, n_years=n_years)  # [修正H]
 
-        # 驗證結果
-        validation_results = validate_dcf_result(dcf_result, ticker)
+        # [修正C+D] 傳入 long_term_growth_rate 進行完整4項驗證
+        validation_results = validate_dcf_result(dcf_result, ticker, long_term_growth_rate=ltg_val)
         st.markdown("### 🔍 DCF計算結果驗證")
         for res in validation_results:
             if "✅" in res:
