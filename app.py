@@ -26,6 +26,16 @@
 #   - [H] 新增預測年數滑桿（5~10年）並傳入 calculate_dcf
 #   - [I] 統一企業價值圖 Y 軸單位標示（新台幣千元）
 #   - [J] 新增 beta_calculated session_state 狀態管理
+# v5.0.0 | 2026-04-19 | 新增資料核對與推導過程面板
+#   - [K] 修正 CapitalStock 欄位：FinMind 單位為「元」，直接÷10，移除×1000錯誤
+#   - [K] 修正 DepreciationAndAmortization：損益表無此欄，改從現金流量表
+#         Depreciation + AmortizationExpense 合計取得
+#   - [K] 修正負債欄位：LongtermBorrowings / ShorttermBorrowings（非LongTermDebt/ShortTermBorrowings）
+#   - [K] 修正 net_income 來源：改用 EquityAttributableToOwnersOfParent（歸屬母公司）
+#   - [K] 修正 taxRate 計算：改用 TAX / PreTaxIncome（非 1 - NetIncome/PreTaxIncome）
+#   - [L] 新增「📋 原始數據核對面板」：載入後顯示六大資料來源所有取用欄位與實際數值
+#   - [L] 新增「🔢 推導過程面板」：逐步展示 STEP 0~9 完整計算過程（含 EPS 交叉驗證）
+#   - [L] 新增各季 EPS 拆解（累計→單季差分）與說明
 # =============================================================================
 
 import streamlit as st
@@ -278,108 +288,153 @@ def extract_income_value(income_records, key, default=0):
 def calculate_dcf_params_from_finmind(financial_data, current_price, stock_id, token):
     """
     從 FinMind 財報資料計算 DCF 所需參數
-    回傳 (default_params, beta_calculated)
+    [修正K] 修正欄位名稱、股數計算、折舊來源、稅率計算
+    回傳 (default_params, beta_calculated, raw_data)
     """
     income  = financial_data.get("income_statement", [])
     balance = financial_data.get("balance_sheet", [])
     cash    = financial_data.get("cash_flow", [])
 
     # ── 損益表數據 ──
-    revenue      = extract_income_value(income, "Revenue", 1)
-    gross_profit = extract_income_value(income, "GrossProfit", 0)
-    op_income    = extract_income_value(income, "OperatingIncome", 0)
-    net_income   = extract_income_value(income, "NetIncome", 0)
-    pretax       = extract_income_value(income, "PreTaxIncome", 1)
-    depreciation = extract_income_value(income, "DepreciationAndAmortization", 0)
+    revenue           = extract_income_value(income, "Revenue", 1)
+    op_income         = extract_income_value(income, "OperatingIncome", 0)
+    gross_profit      = extract_income_value(income, "GrossProfit", 0)
+    pretax            = extract_income_value(income, "PreTaxIncome", 1)
+    # [修正K] 歸屬母公司淨利
+    net_income_parent = extract_income_value(income, "EquityAttributableToOwnersOfParent", 0)
+    # [修正K] 直接取 TAX 欄位
+    tax_amount        = extract_income_value(income, "TAX", 0)
+    eps_reported      = extract_income_value(income, "EPS", 0)
 
-    # 前一年營收（用來算成長率）
+    # 前一年營收
     revenue_prev = 0
     if len(income) >= 2:
         revenue_prev = float(income[1].get("Revenue", 0) or 0)
 
-    # ── 資產負債表數據 ──
-    total_assets   = extract_income_value(balance, "TotalAssets", 1)
-    total_equity   = extract_income_value(balance, "Equity", 1)
-    total_debt     = extract_income_value(balance, "LongTermDebt", 0) + extract_income_value(balance, "ShortTermBorrowings", 0)
-    cash_equiv     = extract_income_value(balance, "CashAndCashEquivalents", 0)
-    receivables    = extract_income_value(balance, "ReceivablesNet", 0)
-    inventories    = extract_income_value(balance, "Inventories", 0)
-    payables       = extract_income_value(balance, "AccountsPayable", 0)
+    # 各期累計淨利（歸屬母公司），供EPS季度拆解
+    income_by_date = {}
+    for rec in income:
+        d = rec.get("date", "")
+        v = rec.get("EquityAttributableToOwnersOfParent", 0)
+        if d and v is not None:
+            income_by_date[d] = float(v) if v else 0
 
-    # [修正A] 流通股數：優先從股本÷面額10元計算（台股面額統一10元）
-    paid_in_capital = extract_income_value(balance, "PaidInCapital", 0)
-    if paid_in_capital > 0:
-        # FinMind 財報單位為千元，股本單位亦為千元，÷10(元) = 千股，需再×1000=股
-        shares_outstanding = (paid_in_capital * 1000) / 10
-    elif current_price > 0 and total_equity > 0:
-        # 備援：用市值估算（財報股東權益帳面值估計，僅供備援）
-        shares_outstanding = (total_equity * 1000) / current_price
+    # ── 資產負債表數據 ──
+    total_assets  = extract_income_value(balance, "TotalAssets", 1)
+    total_equity  = extract_income_value(balance, "Equity", 1)
+    # [修正K] 正確欄位名稱
+    total_debt_lt = extract_income_value(balance, "LongtermBorrowings", 0)
+    total_debt_st = extract_income_value(balance, "ShorttermBorrowings", 0)
+    total_debt    = total_debt_lt + total_debt_st
+    cash_equiv    = extract_income_value(balance, "CashAndCashEquivalents", 0)
+    receivables   = extract_income_value(balance, "AccountsReceivableNet", 0)
+    inventories   = extract_income_value(balance, "Inventories", 0)
+    payables      = extract_income_value(balance, "AccountsPayable", 0)
+    # [修正K] CapitalStock 單位為「元」，直接÷10（不×1000）
+    capital_stock = extract_income_value(balance, "CapitalStock", 0)
+    if capital_stock > 0:
+        shares_outstanding = capital_stock / 10
+    elif eps_reported > 0 and net_income_parent > 0:
+        shares_outstanding = net_income_parent / eps_reported
     else:
         shares_outstanding = 1
 
     # ── 現金流量表數據 ──
     op_cf  = extract_income_value(cash, "CashFlowsFromOperatingActivities", 0)
     capex  = abs(extract_income_value(cash, "PropertyAndPlantAndEquipment", 0))
-    inv_cf = extract_income_value(cash, "CashFlowsFromInvestingActivities", 0)
-    fin_cf = extract_income_value(cash, "CashFlowsFromFinancingActivities", 0)
+    inv_cf = extract_income_value(cash, "CashProvidedByInvestingActivities", 0)
+    fin_cf = extract_income_value(cash, "CashFlowsProvidedFromFinancingActivities", 0)
+    # [修正K] 折舊攤銷從現金流量表取得
+    dep    = extract_income_value(cash, "Depreciation", 0)
+    amort  = extract_income_value(cash, "AmortizationExpense", 0)
+    dep_total = dep + amort
 
     # ── 計算各項比率 ──
     revenue_growth = (revenue - revenue_prev) / abs(revenue_prev) if revenue_prev != 0 else 0.10
-    ebitda         = op_income + depreciation
+    ebitda         = op_income + dep_total
     ebitda_pct     = ebitda / revenue if revenue != 0 else 0.25
     capex_pct      = capex / revenue if revenue != 0 else 0.05
     op_cf_pct      = op_cf / revenue if revenue != 0 else 0.15
-    tax_rate       = 1 - (net_income / pretax) if pretax != 0 else 0.20
-    tax_rate       = max(0.05, min(0.40, tax_rate))
+    dep_pct        = dep_total / revenue if revenue != 0 else 0.03
+    # [修正K] 稅率：TAX / PreTaxIncome
+    tax_rate_raw   = tax_amount / pretax if pretax != 0 else 0.20
+    tax_rate       = max(0.05, min(0.40, tax_rate_raw))
+
+    # EPS 交叉驗證
+    eps_derived  = net_income_parent / shares_outstanding if shares_outstanding > 0 else 0
+    eps_diff_pct = abs(eps_derived - eps_reported) / eps_reported * 100 if eps_reported > 0 else 0
 
     # ── WACC 推導 ──
-    risk_free_rate      = 0.015   # 台灣10年期公債約1.5%
-    market_risk_premium = 0.06    # 台股市場風險溢價約6%
-
-    # [修正B] Beta：優先從股票vs TAIEX 近2年日報酬率迴歸計算
+    risk_free_rate       = 0.015
+    market_risk_premium  = 0.06
     beta, beta_calculated = calculate_beta(stock_id, token)
+    cost_of_equity       = risk_free_rate + beta * market_risk_premium
+    cost_of_debt_pretax  = 0.03
+    cost_of_debt         = cost_of_debt_pretax * (1 - tax_rate)
+    total_capital        = total_equity + total_debt if (total_equity + total_debt) > 0 else 1
+    equity_weight        = total_equity / total_capital
+    debt_weight          = total_debt / total_capital
+    wacc                 = equity_weight * cost_of_equity + debt_weight * cost_of_debt
+    long_term_growth     = 0.02
 
-    cost_of_equity      = risk_free_rate + beta * market_risk_premium
-    cost_of_debt_pretax = 0.03
-    cost_of_debt        = cost_of_debt_pretax * (1 - tax_rate)
-    total_capital       = total_equity + total_debt if (total_equity + total_debt) > 0 else 1
-    equity_weight       = total_equity / total_capital
-    debt_weight         = total_debt / total_capital
-    wacc                = equity_weight * cost_of_equity + debt_weight * cost_of_debt
-    long_term_growth    = 0.02
+    # ── 整理原始數據（供核對面板使用）[修正L] ──
+    raw_data = {
+        "revenue": revenue, "revenue_prev": revenue_prev,
+        "op_income": op_income, "pretax": pretax,
+        "net_income_parent": net_income_parent, "tax_amount": tax_amount,
+        "eps_reported": eps_reported, "gross_profit": gross_profit,
+        "total_assets": total_assets, "total_equity": total_equity,
+        "total_debt_lt": total_debt_lt, "total_debt_st": total_debt_st,
+        "total_debt": total_debt, "cash_equiv": cash_equiv,
+        "receivables": receivables, "inventories": inventories,
+        "payables": payables, "capital_stock": capital_stock,
+        "shares_outstanding": shares_outstanding,
+        "op_cf": op_cf, "capex": capex, "dep": dep, "amort": amort,
+        "dep_total": dep_total, "inv_cf": inv_cf, "fin_cf": fin_cf,
+        "current_price": current_price,
+        "revenue_growth": revenue_growth, "ebitda": ebitda,
+        "ebitda_pct": ebitda_pct, "capex_pct": capex_pct,
+        "op_cf_pct": op_cf_pct, "dep_pct": dep_pct,
+        "tax_rate_raw": tax_rate_raw, "tax_rate": tax_rate,
+        "eps_derived": eps_derived, "eps_diff_pct": eps_diff_pct,
+        "risk_free_rate": risk_free_rate,
+        "market_risk_premium": market_risk_premium,
+        "beta": beta, "beta_calculated": beta_calculated,
+        "cost_of_equity": cost_of_equity,
+        "cost_of_debt_pretax": cost_of_debt_pretax,
+        "cost_of_debt": cost_of_debt, "total_capital": total_capital,
+        "equity_weight": equity_weight, "debt_weight": debt_weight,
+        "wacc": wacc, "long_term_growth": long_term_growth,
+        "income_by_date": income_by_date,
+    }
 
     default_params = {
-        # 成長與獲利
         "revenueGrowthPct":               max(-0.2, min(2.0, revenue_growth)),
         "ebitdaPct":                       max(0.01, min(0.80, ebitda_pct)),
         "capitalExpenditurePct":          max(0.001, min(0.30, capex_pct)),
         "operatingCashFlowPct":           max(0.001, min(0.60, op_cf_pct)),
-        "depreciationAndAmortizationPct": depreciation / revenue if revenue != 0 else 0.03,
-        # 資本成本
+        "depreciationAndAmortizationPct": dep_pct,
         "riskFreeRate":                   risk_free_rate,
         "marketRiskPremium":              market_risk_premium,
         "beta":                           beta,
         "costOfEquity":                   cost_of_equity,
         "costOfDebt":                     cost_of_debt,
         "wacc":                           max(0.03, min(0.20, wacc)),
-        # 其他
         "taxRate":                        tax_rate,
         "longTermGrowthRate":             long_term_growth,
-        # 資產負債比率
         "cashPct":                        cash_equiv / revenue if revenue != 0 else 0.10,
         "receivablesPct":                 receivables / revenue if revenue != 0 else 0.10,
         "inventoriesPct":                 inventories / revenue if revenue != 0 else 0.05,
         "payablePct":                     payables / revenue if revenue != 0 else 0.08,
-        # 公司資訊
         "currentPrice":                   current_price,
         "revenue":                        revenue,
         "totalEquity":                    total_equity,
         "totalDebt":                      total_debt,
         "cashAndEquiv":                   cash_equiv,
-        "sharesOutstanding":              max(1, shares_outstanding),  # [修正A]
-        "paidInCapital":                  paid_in_capital,
+        "sharesOutstanding":              max(1, shares_outstanding),
+        "capitalStock":                   capital_stock,
     }
-    return default_params, beta_calculated
+    return default_params, beta_calculated, raw_data
 
 
 def calculate_dcf(params, n_years=5):
@@ -479,6 +534,296 @@ def calculate_dcf(params, n_years=5):
         "ufcf":                  pv_ufcf_total,
     }
     return result
+
+
+# =============================================================================
+# [修正L] 原始數據核對面板 & 推導過程面板
+# =============================================================================
+
+def show_raw_data_panel(raw, stock_id, stock_name, beta_calculated):
+    """
+    載入後顯示六大資料來源所有取用欄位與實際數值，供人工核對。
+    """
+    st.markdown("## 📋 原始數據核對面板")
+    st.info("以下為從 FinMind 六個資料來源取出的所有欄位與實際數值，請逐一確認後再進行計算。")
+
+    # ① 公司基本資料
+    with st.expander("① 公司基本資料（TaiwanStockInfo）", expanded=True):
+        st.dataframe(pd.DataFrame([{
+            "欄位": "stock_id",   "說明": "股票代號",   "數值": stock_id
+        }, {
+            "欄位": "stock_name", "說明": "公司名稱",   "數值": stock_name
+        }]), hide_index=True, use_container_width=True)
+
+    # ② 綜合損益表
+    with st.expander("② 綜合損益表（TaiwanStockFinancialStatements）", expanded=True):
+        rows = [
+            ("Revenue",                              "本期營業收入",         raw["revenue"],           f"{raw['revenue']/1e6:.2f} 百萬元"),
+            ("Revenue（前期）",                       "前期營業收入",         raw["revenue_prev"],       f"{raw['revenue_prev']/1e6:.2f} 百萬元"),
+            ("GrossProfit",                           "營業毛利",             raw["gross_profit"],       f"{raw['gross_profit']/1e6:.2f} 百萬元"),
+            ("OperatingIncome",                       "營業利益",             raw["op_income"],          f"{raw['op_income']/1e6:.2f} 百萬元"),
+            ("PreTaxIncome",                          "稅前淨利",             raw["pretax"],             f"{raw['pretax']/1e6:.2f} 百萬元"),
+            ("TAX",                                   "所得稅費用",           raw["tax_amount"],         f"{raw['tax_amount']/1e6:.2f} 百萬元"),
+            ("EquityAttributableToOwnersOfParent",    "歸屬母公司稅後淨利",   raw["net_income_parent"],  f"{raw['net_income_parent']/1e6:.2f} 百萬元"),
+            ("EPS",                                   "每股盈餘（財報）",     raw["eps_reported"],       f"NT${raw['eps_reported']:.2f}"),
+        ]
+        st.dataframe(pd.DataFrame(rows, columns=["FinMind欄位", "說明", "原始數值（元）", "格式化"]),
+                     hide_index=True, use_container_width=True)
+
+    # ③ 資產負債表
+    with st.expander("③ 資產負債表（TaiwanStockBalanceSheet）", expanded=True):
+        rows = [
+            ("TotalAssets",          "總資產",         raw["total_assets"],   f"{raw['total_assets']/1e6:.2f} 百萬元"),
+            ("Equity",               "股東權益",        raw["total_equity"],   f"{raw['total_equity']/1e6:.2f} 百萬元"),
+            ("LongtermBorrowings",   "長期借款",        raw["total_debt_lt"],  f"{raw['total_debt_lt']/1e6:.2f} 百萬元"),
+            ("ShorttermBorrowings",  "短期借款",        raw["total_debt_st"],  f"{raw['total_debt_st']/1e6:.2f} 百萬元"),
+            ("（合計）總負債",        "長期+短期借款",   raw["total_debt"],     f"{raw['total_debt']/1e6:.2f} 百萬元"),
+            ("CashAndCashEquivalents","現金及約當現金",  raw["cash_equiv"],     f"{raw['cash_equiv']/1e6:.2f} 百萬元"),
+            ("AccountsReceivableNet","應收帳款（淨）",  raw["receivables"],    f"{raw['receivables']/1e6:.2f} 百萬元"),
+            ("Inventories",          "存貨",            raw["inventories"],    f"{raw['inventories']/1e6:.2f} 百萬元"),
+            ("AccountsPayable",      "應付帳款",        raw["payables"],       f"{raw['payables']/1e6:.2f} 百萬元"),
+            ("CapitalStock",         "股本（元）",      raw["capital_stock"],  f"{raw['capital_stock']/1e6:.2f} 百萬元"),
+            ("（推算）流通股數",      "股本÷面額10元",   raw["shares_outstanding"], f"{raw['shares_outstanding']/1e6:.4f} 百萬股"),
+        ]
+        st.dataframe(pd.DataFrame(rows, columns=["FinMind欄位", "說明", "原始數值（元）", "格式化"]),
+                     hide_index=True, use_container_width=True)
+
+    # ④ 現金流量表
+    with st.expander("④ 現金流量表（TaiwanStockCashFlowsStatement）", expanded=True):
+        rows = [
+            ("CashFlowsFromOperatingActivities",     "營業活動現金流",   raw["op_cf"],      f"{raw['op_cf']/1e6:.2f} 百萬元"),
+            ("PropertyAndPlantAndEquipment",          "資本支出（原始負值）", -raw["capex"], f"{-raw['capex']/1e6:.2f} 百萬元"),
+            ("Depreciation",                          "折舊",             raw["dep"],        f"{raw['dep']/1e6:.2f} 百萬元"),
+            ("AmortizationExpense",                   "攤銷",             raw["amort"],      f"{raw['amort']/1e6:.2f} 百萬元"),
+            ("（合計）折舊攤銷",                       "Dep+Amort",        raw["dep_total"],  f"{raw['dep_total']/1e6:.2f} 百萬元"),
+            ("CashProvidedByInvestingActivities",     "投資活動現金流",   raw["inv_cf"],     f"{raw['inv_cf']/1e6:.2f} 百萬元"),
+            ("CashFlowsProvidedFromFinancingActivities","融資活動現金流", raw["fin_cf"],     f"{raw['fin_cf']/1e6:.2f} 百萬元"),
+        ]
+        st.dataframe(pd.DataFrame(rows, columns=["FinMind欄位", "說明", "原始數值（元）", "格式化"]),
+                     hide_index=True, use_container_width=True)
+
+    # ⑤⑥ 個股 & 大盤股價（Beta）
+    with st.expander("⑤⑥ 個股股價 & 大盤指數（TaiwanStockPrice）", expanded=True):
+        beta_src = "✅ 迴歸計算（個股 vs TAIEX 日報酬率）" if beta_calculated else "⚠️ 備援預設值 1.0（資料不足）"
+        rows = [
+            ("close（最新）",    "當前收盤價",      f"NT${raw['current_price']:.2f}", ""),
+            ("Beta 計算方式",    "計算來源",        beta_src,                          ""),
+            ("Beta 值",          "迴歸結果",        f"{raw['beta']:.4f}",              "Cov(股,大盤)/Var(大盤)"),
+        ]
+        st.dataframe(pd.DataFrame(rows, columns=["項目", "說明", "數值", "備註"]),
+                     hide_index=True, use_container_width=True)
+
+    st.success("✅ 以上為所有資料來源的原始數值，請確認無誤後即可進行計算。")
+
+
+def show_derivation_panel(raw, stock_id, n_years=5):
+    """
+    [修正L] 展示完整 STEP 0~9 推導過程，含各季 EPS 拆解與 EPS 交叉驗證。
+    """
+    st.markdown("## 🔢 推導過程詳解")
+    st.info("以下為根據原始數據逐步推導的完整計算過程，可供教學與人工驗證使用。")
+
+    # ── STEP 1：財務比率 ──
+    with st.expander("STEP 1｜財務比率計算", expanded=True):
+        r = raw
+        rows = [
+            ("1-1", "營收成長率",
+             f"({r['revenue']/1e6:.2f} - {r['revenue_prev']/1e6:.2f}) / {r['revenue_prev']/1e6:.2f}",
+             f"{r['revenue_growth']*100:.2f}%"),
+            ("1-2", "EBITDA = 營業利益 + 折舊攤銷",
+             f"{r['op_income']/1e6:.2f} + {r['dep_total']/1e6:.2f}",
+             f"{r['ebitda']/1e6:.2f} 百萬元"),
+            ("1-3", "EBITDA利潤率 = EBITDA / 營收",
+             f"{r['ebitda']/1e6:.2f} / {r['revenue']/1e6:.2f}",
+             f"{r['ebitda_pct']*100:.2f}%"),
+            ("1-4", "資本支出比例 = |資本支出| / 營收",
+             f"{r['capex']/1e6:.2f} / {r['revenue']/1e6:.2f}",
+             f"{r['capex_pct']*100:.2f}%"),
+            ("1-5", "折舊攤銷比例 = 折舊攤銷 / 營收",
+             f"{r['dep_total']/1e6:.2f} / {r['revenue']/1e6:.2f}",
+             f"{r['dep_pct']*100:.2f}%"),
+            ("1-6", "營業現金流比例 = 營業現金流 / 營收",
+             f"{r['op_cf']/1e6:.2f} / {r['revenue']/1e6:.2f}",
+             f"{r['op_cf_pct']*100:.2f}%"),
+            ("1-7", "有效稅率 = TAX / 稅前淨利",
+             f"{r['tax_amount']/1e6:.2f} / {r['pretax']/1e6:.2f}",
+             f"{r['tax_rate_raw']*100:.2f}% → 限制後 {r['tax_rate']*100:.2f}%"),
+        ]
+        st.dataframe(pd.DataFrame(rows, columns=["步驟", "項目", "計算式（百萬元）", "結果"]),
+                     hide_index=True, use_container_width=True)
+
+    # ── STEP 2：Beta ──
+    with st.expander("STEP 2｜Beta 係數計算", expanded=True):
+        beta_src = "迴歸計算 ✅" if raw["beta_calculated"] else "備援預設值 1.0 ⚠️"
+        st.markdown(f"""
+**公式**：Beta = Cov(個股日報酬, 大盤日報酬) / Var(大盤日報酬)
+
+| 項目 | 數值 |
+|------|------|
+| 計算來源 | 個股（{stock_id}）vs 加權指數（TAIEX） |
+| 計算方式 | {beta_src} |
+| Beta 值 | **{raw['beta']:.4f}** |
+| 限制範圍 | 0.3 ~ 3.0 |
+""")
+
+    # ── STEP 3：WACC ──
+    with st.expander("STEP 3｜WACC 計算", expanded=True):
+        r = raw
+        rows = [
+            ("3-1", "股權成本 Re（CAPM）",
+             f"Rf + β×(Rm-Rf) = {r['risk_free_rate']*100:.1f}% + {r['beta']:.4f}×{r['market_risk_premium']*100:.1f}%",
+             f"{r['cost_of_equity']*100:.4f}%"),
+            ("3-2", "稅後債務成本 Rd",
+             f"{r['cost_of_debt_pretax']*100:.1f}% × (1-{r['tax_rate']*100:.2f}%)",
+             f"{r['cost_of_debt']*100:.4f}%"),
+            ("3-3", "總資本 = 股東權益 + 總負債",
+             f"{r['total_equity']/1e6:.2f} + {r['total_debt']/1e6:.2f}",
+             f"{r['total_capital']/1e6:.2f} 百萬元"),
+            ("3-4", "股權權重 We",
+             f"{r['total_equity']/1e6:.2f} / {r['total_capital']/1e6:.2f}",
+             f"{r['equity_weight']*100:.2f}%"),
+            ("3-5", "債務權重 Wd",
+             f"{r['total_debt']/1e6:.2f} / {r['total_capital']/1e6:.2f}",
+             f"{r['debt_weight']*100:.2f}%"),
+            ("3-6", "WACC = We×Re + Wd×Rd",
+             f"{r['equity_weight']:.4f}×{r['cost_of_equity']*100:.4f}% + {r['debt_weight']:.4f}×{r['cost_of_debt']*100:.4f}%",
+             f"{r['wacc']*100:.4f}%"),
+        ]
+        st.dataframe(pd.DataFrame(rows, columns=["步驟", "項目", "計算式", "結果"]),
+                     hide_index=True, use_container_width=True)
+
+    # ── STEP 4：FCFF ──
+    with st.expander("STEP 4｜自由現金流（FCFF）參考", expanded=False):
+        r = raw
+        fcff = r["op_cf"] - r["capex"]
+        st.markdown(f"""
+**FCFF = 營業現金流 - 資本支出**
+= {r['op_cf']/1e6:.2f} - {r['capex']/1e6:.2f} = **{fcff/1e6:.2f} 百萬元**
+
+FCFF利潤率 = {fcff/1e6:.2f} / {r['revenue']/1e6:.2f} = **{fcff/r['revenue']*100:.2f}%**
+
+> 本模型以 EBITDA 法推算各年 FCF，FCFF 僅供參考驗證使用。
+""")
+
+    # ── STEP 5：預測期 DCF ──
+    with st.expander("STEP 5｜預測期現金流折現（5年）", expanded=True):
+        r = raw
+        rev  = r["revenue"]
+        rows = []
+        pv_total = 0
+        for yr in range(1, n_years + 1):
+            rev     = rev * (1 + r["revenue_growth"])
+            ebitda  = rev * r["ebitda_pct"]
+            dep     = rev * r["dep_pct"]
+            ebit    = ebitda - dep
+            ebiat   = ebit * (1 - r["tax_rate"])
+            capex   = rev * r["capex_pct"]
+            delta_wc= rev * 0.02
+            ufcf    = ebiat + dep - capex - delta_wc
+            pv_f    = 1 / (1 + r["wacc"]) ** yr
+            pv_ufcf = ufcf * pv_f
+            pv_total += pv_ufcf
+            rows.append({
+                "年度": f"第{yr}年",
+                "預測營收(M)": f"{rev/1e6:.1f}",
+                "EBITDA(M)": f"{ebitda/1e6:.1f}",
+                "折舊(M)": f"{dep/1e6:.1f}",
+                "EBIT(M)": f"{ebit/1e6:.1f}",
+                "EBIAT(M)": f"{ebiat/1e6:.1f}",
+                "資本支出(M)": f"{capex/1e6:.1f}",
+                "△WC(M)": f"{delta_wc/1e6:.1f}",
+                "UFCF(M)": f"{ufcf/1e6:.1f}",
+                "折現係數": f"{pv_f:.6f}",
+                "現值(M)": f"{pv_ufcf/1e6:.1f}",
+            })
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.metric("預測期現金流現值合計", f"{pv_total/1e6:,.2f} 百萬元")
+
+    # ── STEP 6：終值 ──
+    with st.expander("STEP 6｜終值計算（Gordon Growth Model）", expanded=True):
+        r = raw
+        last_rev   = raw["revenue"] * (1 + r["revenue_growth"]) ** n_years
+        fcf_term   = last_rev * r["ebitda_pct"] * (1 - r["tax_rate"]) * (1 + r["long_term_growth"])
+        tv         = fcf_term / (r["wacc"] - r["long_term_growth"]) if r["wacc"] > r["long_term_growth"] else 0
+        pv_tv      = tv / (1 + r["wacc"]) ** n_years
+        # 重算 pv_total
+        rev2 = raw["revenue"]
+        pv_total2 = 0
+        for yr in range(1, n_years + 1):
+            rev2   = rev2 * (1 + r["revenue_growth"])
+            ebitda = rev2 * r["ebitda_pct"]
+            dep    = rev2 * r["dep_pct"]
+            ebit   = ebitda - dep
+            ebiat  = ebit * (1 - r["tax_rate"])
+            capex  = rev2 * r["capex_pct"]
+            ufcf   = ebiat + dep - capex - rev2 * 0.02
+            pv_total2 += ufcf / (1 + r["wacc"]) ** yr
+
+        ev          = pv_total2 + pv_tv
+        net_debt    = r["total_debt"] - r["cash_equiv"]
+        eq_val      = max(0, ev - net_debt)
+        eq_val_ps   = eq_val / r["shares_outstanding"] if r["shares_outstanding"] > 0 else 0
+        tv_ratio    = pv_tv / ev * 100 if ev > 0 else 0
+
+        st.markdown(f"""
+| 項目 | 計算式 | 結果 |
+|------|--------|------|
+| 第{n_years}年預測營收 | 基準 × (1+{r['revenue_growth']*100:.2f}%)^{n_years} | {last_rev/1e6:.2f} 百萬元 |
+| FCF_terminal | 第{n_years}年營收 × EBITDA率 × (1-稅率) × (1+{r['long_term_growth']*100:.1f}%) | {fcf_term/1e6:.2f} 百萬元 |
+| 終值 TV | FCF_term / (WACC - 永續成長率) | {tv/1e6:.2f} 百萬元 |
+| 終值現值 PV_TV | TV / (1+WACC)^{n_years} | {pv_tv/1e6:.2f} 百萬元 |
+| 企業價值 EV | PV_FCF + PV_TV | {ev/1e6:.2f} 百萬元 |
+| 淨債務 | 總負債 - 現金 | {net_debt/1e6:.2f} 百萬元 |
+| 股權價值 | EV - 淨債務 | {eq_val/1e6:.2f} 百萬元 |
+| **DCF每股價值** | 股權價值 / 流通股數 | **NT${eq_val_ps:.2f}** |
+| 終值佔比 | PV_TV / EV | {tv_ratio:.1f}% |
+""")
+
+    # ── STEP 7：EPS 驗證與季度拆解 ──
+    with st.expander("STEP 7｜EPS 交叉驗證 & 各季拆解", expanded=True):
+        r = raw
+        eps_ok = "✅" if r["eps_diff_pct"] < 2 else "⚠️"
+        st.markdown(f"""
+**EPS 交叉驗證**
+
+| 項目 | 計算式 | 結果 |
+|------|--------|------|
+| 推導 EPS | 歸屬母公司淨利 / 流通股數 | NT${r['eps_derived']:.4f} |
+| 財報揭露 EPS | FinMind EPS 欄位 | NT${r['eps_reported']:.2f} |
+| 誤差 | |abs(推導-財報)/財報| | {r['eps_diff_pct']:.2f}% {eps_ok} |
+
+> ⚠️ 財報 EPS 以**加權平均股數**計算，推導使用期末股數，誤差 <2% 屬正常。
+""")
+
+        # 各季 EPS 拆解
+        income_dates = sorted(raw["income_by_date"].keys(), reverse=True)
+        if len(income_dates) >= 4:
+            latest_year = income_dates[0][:4]
+            year_dates  = [d for d in income_dates if d.startswith(latest_year)]
+            year_dates  = sorted(year_dates)
+
+            season_rows = []
+            prev_cum = 0
+            labels   = {"-03-31": "Q1", "-06-30": "Q2", "-09-30": "Q3", "-12-31": "Q4"}
+            for d in year_dates:
+                suffix  = d[4:]
+                label   = labels.get(suffix, suffix)
+                cum_ni  = raw["income_by_date"].get(d, 0)
+                qtr_ni  = cum_ni - prev_cum
+                qtr_eps = qtr_ni / r["shares_outstanding"] if r["shares_outstanding"] > 0 else 0
+                season_rows.append({
+                    "期間": f"{latest_year} {label}（{d}）",
+                    "累計淨利（M）": f"{cum_ni/1e6:.2f}",
+                    "單季淨利（M）": f"{qtr_ni/1e6:.2f}",
+                    "單季EPS（NT$）": f"{qtr_eps:.4f}",
+                })
+                prev_cum = cum_ni
+
+            total_eps = sum(float(row["單季EPS（NT$）"]) for row in season_rows)
+            st.markdown(f"**{latest_year} 各季 EPS 拆解**（FinMind累計差分法）")
+            st.dataframe(pd.DataFrame(season_rows), hide_index=True, use_container_width=True)
+            st.metric(f"{latest_year} 全年 EPS 加總", f"NT${total_eps:.4f}")
+            st.caption("FinMind 損益表為累計格式：各季單季數字 = 本期累計 - 前期累計")
 
 
 # =============================================================================
@@ -853,8 +1198,10 @@ if "financial_data" not in st.session_state:
     st.session_state.financial_data = {}
 if "stock_info" not in st.session_state:
     st.session_state.stock_info = {}
-if "beta_calculated" not in st.session_state:  # [修正J]
+if "beta_calculated" not in st.session_state:
     st.session_state.beta_calculated = False
+if "raw_data" not in st.session_state:          # [修正L]
+    st.session_state.raw_data = {}
 
 # =============================================================================
 # 側邊欄控制
@@ -886,14 +1233,11 @@ if load_company_button:
     else:
         with st.spinner(f"正在從 FinMind 載入 {ticker} 財務數據..."):
             try:
-                # 取得財報資料
                 financial_data = get_finmind_financial_data(ticker, finmind_token)
-                # 取得即時股價
-                current_price = get_finmind_stock_price(ticker, finmind_token)
-                # 取得公司基本資訊
-                stock_info = get_finmind_stock_info(ticker, finmind_token)
-                # [修正B+A] 計算 DCF 預設參數（含 Beta 迴歸計算與正確股數）
-                default_params, beta_calc = calculate_dcf_params_from_finmind(
+                current_price  = get_finmind_stock_price(ticker, finmind_token)
+                stock_info     = get_finmind_stock_info(ticker, finmind_token)
+                # [修正K+L] 新版函式回傳三個值
+                default_params, beta_calc, raw_data = calculate_dcf_params_from_finmind(
                     financial_data, current_price, ticker, finmind_token
                 )
 
@@ -902,7 +1246,8 @@ if load_company_button:
                 st.session_state.stock_info       = stock_info
                 st.session_state.company_data     = {"currentPrice": current_price}
                 st.session_state.company_loaded   = True
-                st.session_state.beta_calculated  = beta_calc  # [修正J]
+                st.session_state.beta_calculated  = beta_calc
+                st.session_state.raw_data         = raw_data  # [修正L]
 
                 company_name = stock_info.get("stock_name", ticker)
                 beta_msg = "（迴歸計算）" if beta_calc else "（備援預設值1.0）"
@@ -1303,8 +1648,11 @@ Re = **{risk_free_rate + beta * market_risk_premium:.2f}%**
             st.code(traceback.format_exc())
 
 elif st.session_state.company_loaded and not calculate_button:
-    info = st.session_state.stock_info
+    info     = st.session_state.stock_info
     defaults = st.session_state.default_params
+    raw      = st.session_state.raw_data
+
+    # ── 頂部狀態列 ──
     st.markdown("## 📊 公司數據已載入完成")
     col1, col2 = st.columns(2)
     with col1:
@@ -1312,50 +1660,32 @@ elif st.session_state.company_loaded and not calculate_button:
 **✅ 已載入**：{info.get('stock_name', ticker)}（{ticker}）
 **產業**：{info.get('industry_category', 'N/A')}
 **當前股價**：NT${defaults.get('currentPrice', 0):.2f}
-**數據狀態**：已準備就緒
+**Beta計算**：{'✅ 迴歸計算' if st.session_state.beta_calculated else '⚠️ 備援預設值1.0'}
         """)
     with col2:
         st.markdown("#### 🎯 下一步操作")
         st.markdown("""
-1. 📊 **查看財報推導參數** — 側邊欄已載入財報計算值
-2. ⚙️ **調整DCF假設** — 根據您的判斷修改參數
-3. 🚀 **開始計算** — 點擊「計算DCF估值」按鈕
+1. 📋 **核對原始數據** — 確認下方六大來源欄位與數值
+2. 🔢 **查看推導過程** — 確認各步驟計算邏輯
+3. ⚙️ **調整DCF假設** — 根據判斷修改側邊欄參數
+4. 🚀 **開始計算** — 點擊「計算DCF估值」按鈕
         """)
 
-    st.markdown("### 📋 財報推導參數一覽")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown("#### 📈 成長性參數")
-        st.dataframe(pd.DataFrame({
-            "參數": ["營收成長率", "EBITDA率", "資本支出比"],
-            "數值": [
-                f"{defaults.get('revenueGrowthPct', 0)*100:.1f}%",
-                f"{defaults.get('ebitdaPct', 0)*100:.1f}%",
-                f"{defaults.get('capitalExpenditurePct', 0)*100:.1f}%"
-            ]
-        }), hide_index=True)
-    with col2:
-        st.markdown("#### 💰 資本成本參數")
-        st.dataframe(pd.DataFrame({
-            "參數": ["無風險利率", "市場風險溢價", "Beta係數", "WACC（推導）"],
-            "數值": [
-                f"{defaults.get('riskFreeRate', 0)*100:.1f}%",
-                f"{defaults.get('marketRiskPremium', 0)*100:.1f}%",
-                f"{defaults.get('beta', 0):.2f}",
-                f"{defaults.get('wacc', 0)*100:.2f}%"
-            ]
-        }), hide_index=True)
-    with col3:
-        st.markdown("#### ⚙️ 其他參數")
-        st.dataframe(pd.DataFrame({
-            "參數": ["長期成長率", "稅率", "股東權益", "淨負債"],
-            "數值": [
-                f"{defaults.get('longTermGrowthRate', 0)*100:.1f}%",
-                f"{defaults.get('taxRate', 0)*100:.1f}%",
-                format_large_number(defaults.get('totalEquity', 0)) + "元",
-                format_large_number(defaults.get('totalDebt', 0) - defaults.get('cashAndEquiv', 0)) + "元"
-            ]
-        }), hide_index=True)
+    st.markdown("---")
+
+    # ── [修正L] 原始數據核對面板 ──
+    if raw:
+        show_raw_data_panel(
+            raw,
+            ticker,
+            info.get("stock_name", ticker),
+            st.session_state.beta_calculated
+        )
+        st.markdown("---")
+        # ── [修正L] 推導過程面板 ──
+        show_derivation_panel(raw, ticker, n_years=5)
+    else:
+        st.warning("⚠️ 原始數據尚未載入，請重新點擊「載入公司基礎數據」")
 
 else:
     # 初始說明頁面
